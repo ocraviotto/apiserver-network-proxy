@@ -2,16 +2,20 @@ package options
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/apiserver-network-proxy/pkg/agent"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/features"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
 
@@ -55,6 +59,26 @@ type GrpcProxyAgentOptions struct {
 	WarnOnChannelLimit bool
 
 	SyncForever bool
+	BindAddress        string
+	ApiServerMapping   portMapping
+}
+
+var _ pflag.Value = &portMapping{}
+
+// port mapping represents the mapping between a local port and a remote
+// destination.
+type portMapping agent.PortMapping
+
+func (pm *portMapping) String() string {
+	return (*agent.PortMapping)(pm).String()
+}
+
+func (pm *portMapping) Set(s string) error {
+	return (*agent.PortMapping)(pm).Parse(s)
+}
+
+func (pm *portMapping) Type() string {
+	return "portMapping"
 }
 
 func (o *GrpcProxyAgentOptions) ClientSetConfig(dialOptions ...grpc.DialOption) *agent.ClientSetConfig {
@@ -92,6 +116,10 @@ func (o *GrpcProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.ServiceAccountTokenPath, "service-account-token-path", o.ServiceAccountTokenPath, "If non-empty proxy agent uses this token to prove its identity to the proxy server.")
 	flags.StringVar(&o.AgentIdentifiers, "agent-identifiers", o.AgentIdentifiers, "Identifiers of the agent that will be used by the server when choosing agent. N.B. the list of identifiers must be in URL encoded format. e.g.,host=localhost&host=node1.mydomain.com&cidr=127.0.0.1/16&ipv4=1.2.3.4&ipv4=5.6.7.8&ipv6=:::::&default-route=true")
 	flags.BoolVar(&o.WarnOnChannelLimit, "warn-on-channel-limit", o.WarnOnChannelLimit, "Turns on a warning if the system is going to push to a full channel. The check involves an unsafe read.")
+	flags.Var(&o.ApiServerMapping, "apiserver-port-mapping", "Mapping between a local port and the host:port used to reach the Kubernetes API Server")
+	flags.StringVar(&o.BindAddress, "bind-address", o.BindAddress, "Address used to listen for traffic generated on cluster network")
+	// add feature gates flag
+	features.DefaultMutableFeatureGate.AddFlag(flags)
 	flags.BoolVar(&o.SyncForever, "sync-forever", o.SyncForever, "If true, the agent continues syncing, in order to support server count changes.")
 	return flags
 }
@@ -115,6 +143,10 @@ func (o *GrpcProxyAgentOptions) Print() {
 	klog.V(1).Infof("ServiceAccountTokenPath set to %q.\n", o.ServiceAccountTokenPath)
 	klog.V(1).Infof("AgentIdentifiers set to %s.\n", util.PrettyPrintURL(o.AgentIdentifiers))
 	klog.V(1).Infof("WarnOnChannelLimit set to %t.\n", o.WarnOnChannelLimit)
+	if features.DefaultMutableFeatureGate.Enabled(features.NodeToMasterTraffic) {
+		klog.V(1).Infof("AgentBindAddress set to %s.\n", o.BindAddress)
+		klog.V(1).Infof("Apiserver port mapping set to %s.\n", o.ApiServerMapping.String())
+	}
 	klog.V(1).Infof("SyncForever set to %v.\n", o.SyncForever)
 }
 
@@ -163,6 +195,24 @@ func (o *GrpcProxyAgentOptions) Validate() error {
 	if err := validateAgentIdentifiers(o.AgentIdentifiers); err != nil {
 		return fmt.Errorf("agent address is invalid: %v", err)
 	}
+	if err := validateHostnameOrIP(o.BindAddress); err != nil {
+		return fmt.Errorf("agent bind address is invalid: %v", err)
+	}
+	if err := validateHostnameOrIP(o.ApiServerMapping.RemoteHost); err != nil {
+		return fmt.Errorf("apiserver address is invalid: %v", err)
+	}
+	if o.ApiServerMapping.LocalPort > 49151 {
+		return fmt.Errorf("please do not try to use ephemeral port %d for the apiserver local port", o.ApiServerMapping.LocalPort)
+	}
+	if o.ApiServerMapping.LocalPort < 1024 {
+		return fmt.Errorf("please do not try to use reserved port %d for the apiserver local port", o.ApiServerMapping.LocalPort)
+	}
+	if o.ApiServerMapping.RemotePort > 49151 {
+		return fmt.Errorf("please do not try to use ephemeral port %d for the apiserver remote port", o.ApiServerMapping.LocalPort)
+	}
+	if o.ApiServerMapping.RemotePort < 1 {
+		return fmt.Errorf("invalid port %d for the apiserver remote port", o.ApiServerMapping.RemotePort)
+	}
 	return nil
 }
 
@@ -181,6 +231,18 @@ func validateAgentIdentifiers(agentIdentifiers string) error {
 		default:
 			return fmt.Errorf("unknown address type: %s", idType)
 		}
+	}
+	return nil
+}
+
+func validateHostnameOrIP(hostnameOrIP string) error {
+	// If it is an IP return immediately otherwise check if it is a hostname
+	if net.ParseIP(hostnameOrIP) != nil {
+		return nil
+	}
+	// If it it not a valid hostname return an error
+	if errs := validation.IsDNS1123Label(hostnameOrIP); len(errs) > 0 {
+		return fmt.Errorf("%s is not a valid ip or hostname: %s", hostnameOrIP, strings.Join(errs, ","))
 	}
 	return nil
 }
@@ -205,6 +267,8 @@ func NewGrpcProxyAgentOptions() *GrpcProxyAgentOptions {
 		ServiceAccountTokenPath:   "",
 		WarnOnChannelLimit:        false,
 		SyncForever:               false,
+		ApiServerMapping:          portMapping{LocalPort: 6443, RemoteHost: "localhost", RemotePort: 6443},
+		BindAddress:               "127.0.0.1",
 	}
 	return &o
 }
