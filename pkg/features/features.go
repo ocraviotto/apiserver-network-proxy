@@ -39,5 +39,6 @@ func init() {
 }
 
 var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
-	NodeToMasterTraffic: {Default: false, PreRelease: featuregate.Alpha},
+	// FIXME this was changed to be enabled by default to make it easy to test the node -> KAS pattern
+	NodeToMasterTraffic: {Default: true, PreRelease: featuregate.Alpha},
 }
