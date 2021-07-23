@@ -673,7 +673,7 @@ func (a *Client) handleConnection(protocol, address string, conn net.Conn) error
 		if res.err != "" {
 			return errors.New(res.err)
 		}
-	case <-time.After(30 * time.Second):
+	case <-time.After(10 * time.Second):
 		return errors.New("dial timeout")
 	}
 

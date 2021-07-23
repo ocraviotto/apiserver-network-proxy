@@ -727,7 +727,7 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 					dialErr = true
 				}
 				// Avoid adding the frontend if there was an error dialing the destination
-				if dialErr == true {
+				if dialErr {
 					break
 				}
 				frontend.connectID = resp.ConnectID
@@ -740,15 +740,20 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 		case client.PacketType_DATA:
 			resp := pkt.GetData()
 			klog.V(5).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
-			frontend, err := s.getFrontend(agentID, resp.ConnectID)
-			if err != nil {
-				klog.ErrorS(err, "could not get frontend client", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
-				break
-			}
-			if err := frontend.send(pkt); err != nil {
-				klog.ErrorS(err, "send to client stream failure", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
+			if resp.ConnectID == int64(KASConnId) {
+				kasConnCtx.dataCh <- resp.Data
 			} else {
-				klog.V(5).InfoS("DATA sent to frontend")
+				frontend, err := s.getFrontend(agentID, resp.ConnectID)
+				if err != nil {
+					klog.ErrorS(err, "could not get frontend client", "connectionID", resp.ConnectID)
+					break
+				}
+				if err := frontend.send(pkt); err != nil {
+					klog.ErrorS(err, "send to client stream failure", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
+				} else {
+					klog.V(5).InfoS("DATA sent to frontend")
+				}
+
 			}
 
 		case client.PacketType_CLOSE_RSP:
@@ -767,10 +772,152 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 			}
 			s.removeFrontend(agentID, resp.ConnectID)
 			klog.V(5).InfoS("Close streaming", "agentID", agentID, "connectionID", resp.ConnectID)
-
+		case client.PacketType_DIAL_REQ:
+			req := pkt.GetDialRequest()
+			klog.V(5).InfoS("Received DIAL_REQ", "target", req.Address)
+			s.handleDialRequest(pkt, backend)
 		default:
 			klog.V(2).InfoS("Unrecognized packet", "packet", pkt, "serverID", s.serverID, "agentID", agentID)
 		}
 	}
 	klog.V(5).InfoS("Close backend of agent", "backend", stream, "serverID", s.serverID, "agentID", agentID)
+}
+
+var kasConnCtx *connContext
+
+const KASConnId int64 = 9999999999
+
+func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
+	klog.V(4).Infoln("received DIAL_REQ")
+	resp := &client.Packet{
+		Type:    client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{DialResponse: &client.DialResponse{}},
+	}
+
+	dialReq := pkt.GetDialRequest()
+	resp.GetDialResponse().Random = dialReq.Random
+
+	start := time.Now()
+	conn, err := net.Dial(dialReq.Protocol, dialReq.Address)
+	if err != nil {
+		resp.GetDialResponse().Error = err.Error()
+		if err := backend.Send(resp); err != nil {
+			klog.ErrorS(err, "could not send stream")
+		}
+		return
+	}
+	metrics.Metrics.ObserveDialLatency(time.Since(start))
+
+	// Even identifiers are used for connections from master to node network,
+	// increment by 2 to maintain the invariant.
+	//connID := atomic.AddInt64(&a.nextConnID, 2)
+	connID := KASConnId
+	dataCh := make(chan []byte, 5)
+	kasConnCtx = &connContext{
+		conn:   conn,
+		dataCh: dataCh,
+		cleanFunc: func() {
+			klog.V(4).InfoS("close connection", "connectionID", connID)
+
+			req := &client.Packet{
+				Type: client.PacketType_CLOSE_REQ,
+				Payload: &client.Packet_CloseRequest{
+					CloseRequest: &client.CloseRequest{
+						ConnectID: connID,
+					},
+				},
+			}
+
+			if err := backend.Send(req); err != nil {
+				klog.ErrorS(err, "close request failure")
+			}
+
+			err := conn.Close()
+			if err != nil {
+				klog.ErrorS(err, "error occurred while closing connection", "connectionID", connID)
+			}
+
+			close(dataCh)
+			//a.connManager.Delete(connID)
+		},
+		backend: backend,
+	}
+
+	resp.GetDialResponse().ConnectID = connID
+	if err := backend.Send(resp); err != nil {
+		klog.ErrorS(err, "backend send failure")
+		return
+	}
+
+	// proxy data to and from KAS for the connection
+	go s.remoteToProxy(connID, kasConnCtx)
+	go s.proxyToRemote(connID, kasConnCtx)
+}
+
+type connContext struct {
+	conn      net.Conn
+	cleanFunc func()
+	dataCh    chan []byte
+	cleanOnce sync.Once
+	backend   Backend
+}
+
+func (c *connContext) cleanup() {
+	c.cleanOnce.Do(c.cleanFunc)
+}
+
+type proxiedKAS struct {
+}
+
+func (s *ProxyServer) remoteToProxy(connID int64, ctx *connContext) {
+	defer ctx.cleanup()
+
+	var buf [1 << 12]byte
+	resp := &client.Packet{
+		Type: client.PacketType_DATA,
+	}
+
+	for {
+		n, err := ctx.conn.Read(buf[:])
+		klog.V(5).InfoS("received data from remote", "bytes", n, "connectionID", connID)
+
+		if err == io.EOF {
+			klog.V(2).Infoln("connection EOF")
+			return
+		} else if err != nil {
+			// Normal when receive a CLOSE_REQ
+			klog.ErrorS(err, "connection read failure")
+			return
+		} else {
+			resp.Payload = &client.Packet_Data{Data: &client.Data{
+				Data:      buf[:n],
+				ConnectID: connID,
+			}}
+			if err := ctx.backend.Send(resp); err != nil {
+				klog.ErrorS(err, "stream send failure")
+			}
+		}
+	}
+}
+
+func (s *ProxyServer) proxyToRemote(connID int64, ctx *connContext) {
+	defer ctx.cleanup()
+
+	for d := range ctx.dataCh {
+		pos := 0
+		for {
+			n, err := ctx.conn.Write(d[pos:])
+			if err == nil {
+				klog.V(4).InfoS("write to remote", "connectionID", connID, "lastData", n)
+				break
+			} else if n > 0 {
+				// https://golang.org/pkg/io/#Writer specifies return non nil error if n < len(d)
+				klog.ErrorS(err, "write to remote with failure", "connectionID", connID, "lastData", n)
+				pos += n
+			} else {
+				klog.ErrorS(err, "conn write failure", "connectionID", connID)
+				return
+			}
+		}
+	}
 }

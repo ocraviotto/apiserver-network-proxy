@@ -88,6 +88,7 @@ func (pf *PortForwarder) Serve(ctx context.Context, pm PortMapping) error {
 		for {
 			klog.V(2).InfoS("listening for connections", "listen-address", listenAddr)
 			conn, err := listener.Accept()
+			klog.V(5).Infof("received connection from %s", conn.LocalAddr().String())
 			if err != nil {
 				select {
 				case <-ctx.Done():
@@ -98,7 +99,9 @@ func (pf *PortForwarder) Serve(ctx context.Context, pm PortMapping) error {
 			} else {
 				// Serve each connection in a dedicated goroutine
 				go func() {
-					if err := pf.handleConnection("tcp", net.JoinHostPort(pm.RemoteHost, strconv.Itoa(pm.RemotePort)), conn); err != nil {
+					target := net.JoinHostPort(pm.RemoteHost, strconv.Itoa(pm.RemotePort))
+					klog.V(5).Infof("forwarding connection to %s", target)
+					if err := pf.handleConnection("tcp", target, conn); err != nil {
 						if err := conn.Close(); err != nil {
 							klog.ErrorS(err, "Error while closing connection")
 						}
