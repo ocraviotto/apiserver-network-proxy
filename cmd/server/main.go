@@ -19,16 +19,24 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 
 	"k8s.io/klog/v2"
 
+	"github.com/google/gops/agent"
 	"sigs.k8s.io/apiserver-network-proxy/cmd/server/app"
 	"sigs.k8s.io/apiserver-network-proxy/cmd/server/app/options"
+
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
 )
 
 func main() {
+	go func() {
+		if err := agent.Listen(agent.Options{}); err != nil {
+			log.Fatal(err)
+		}
+	}()
 	// flag.CommandLine.Parse(os.Args[1:])
 	proxy := &app.Proxy{}
 	o := options.NewProxyRunOptions()
