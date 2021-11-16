@@ -426,7 +426,6 @@ func (a *Client) Serve() {
 				ctx.send(data.Data)
 			}
 
-
 		case client.PacketType_CLOSE_REQ:
 			a.handleCloseRequest(pkt)
 		default:
@@ -468,7 +467,6 @@ func (a *Client) ServeBiDirectional() {
 			klog.ErrorS(err, "could not read stream")
 			return
 		}
-
 		klog.V(5).InfoS("[tracing] recv packet", "type", pkt.Type)
 
 		if pkt == nil {
@@ -557,8 +555,8 @@ func (a *Client) handleDialRequest(pkt *client.Packet) {
 		return
 	}
 
-	go a.remoteToProxy(connID, ctx)
-	go a.proxyToRemote(connID, ctx)
+	go a.agentToProxy(connID, ctx)
+	go a.proxyToAgent(connID, ctx)
 }
 
 func (a *Client) handleDialResponse(pkt *client.Packet) {
@@ -571,12 +569,12 @@ func (a *Client) handleDialResponse(pkt *client.Packet) {
 		klog.Errorf("no pending dial context associated to random %d", dialRes.Random)
 		return
 	}
+
 	pd.resCh <- dialResult{
 		err:    dialRes.Error,
 		connid: dialRes.ConnectID,
 	}
-
-	connID := pkt.GetDialResponse().ConnectID
+	connID := dialRes.ConnectID
 	dataCh := make(chan []byte, 5)
 	ctx := &connContext{
 		conn:   pd.conn,
@@ -608,8 +606,8 @@ func (a *Client) handleDialResponse(pkt *client.Packet) {
 	}
 	a.connManager.Add(connID, ctx)
 
-	go a.remoteToProxy(connID, ctx)
-	go a.proxyToRemote(connID, ctx)
+	go a.agentToProxy(connID, ctx)
+	go a.proxyToAgent(connID, ctx)
 }
 
 func (a *Client) handleCloseRequest(pkt *client.Packet) {
@@ -680,7 +678,7 @@ func (a *Client) handleConnection(protocol, address string, conn net.Conn) error
 	return nil
 }
 
-func (a *Client) remoteToProxy(connID int64, ctx *connContext) {
+func (a *Client) agentToProxy(connID int64, ctx *connContext) {
 	defer func() {
 		if panicInfo := recover(); panicInfo != nil {
 			klog.V(2).InfoS("Exiting remoteToProxy with recovery", "panicInfo", panicInfo, "connectionID", connID)
@@ -698,7 +696,6 @@ func (a *Client) remoteToProxy(connID int64, ctx *connContext) {
 	for {
 		n, err := ctx.conn.Read(buf[:])
 		klog.V(5).InfoS("received data from remote", "bytes", n, "connectionID", connID)
-
 		if err == io.EOF {
 			klog.V(2).InfoS("connection EOF", "connectionID", connID)
 			return
@@ -718,7 +715,7 @@ func (a *Client) remoteToProxy(connID int64, ctx *connContext) {
 	}
 }
 
-func (a *Client) proxyToRemote(connID int64, ctx *connContext) {
+func (a *Client) proxyToAgent(connID int64, ctx *connContext) {
 	defer func() {
 		if panicInfo := recover(); panicInfo != nil {
 			klog.V(2).InfoS("Exiting proxyToRemote with recovery", "panicInfo", panicInfo, "connectionID", connID)

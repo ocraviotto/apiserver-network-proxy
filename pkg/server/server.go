@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/metadata"
@@ -145,6 +146,11 @@ type ProxyServer struct {
 	AgentAuthenticationOptions *AgentTokenAuthenticationOptions
 
 	proxyStrategies []ProxyStrategy
+
+	// for agent initiated connections
+	kasConnections      map[int64]*connContext
+	nextConnID          int64
+	kasConnectionsMutex sync.RWMutex
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -292,7 +298,6 @@ func (s *ProxyServer) removeFrontend(agentID string, connID int64) {
 	if len(s.frontends[agentID]) == 0 {
 		delete(s.frontends, agentID)
 	}
-	return
 }
 
 func (s *ProxyServer) getFrontend(agentID string, connID int64) (*ProxyClientConnection, error) {
@@ -352,6 +357,8 @@ func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCoun
 		Readiness:          bms[0],
 		proxyStrategies:    proxyStrategies,
 		warnOnChannelLimit: warnOnChannelLimit,
+		kasConnections:     make(map[int64]*connContext),
+		nextConnID:         1,
 	}
 }
 
@@ -557,7 +564,7 @@ func (s *ProxyServer) validateAuthToken(ctx context.Context, token string) error
 	}
 	r, err := s.AgentAuthenticationOptions.KubernetesClient.AuthenticationV1().TokenReviews().Create(ctx, trReq, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("Failed to authenticate request. err:%v", err)
+		return fmt.Errorf("failed to authenticate request. err:%v", err)
 	}
 
 	if r.Status.Error != "" {
@@ -594,12 +601,12 @@ func (s *ProxyServer) validateAuthToken(ctx context.Context, token string) error
 func (s *ProxyServer) authenticateAgentViaToken(ctx context.Context) error {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return fmt.Errorf("Failed to retrieve metadata from context")
+		return fmt.Errorf("failed to retrieve metadata from context")
 	}
 
 	authContext := md.Get(header.AuthenticationTokenContextKey)
 	if len(authContext) == 0 {
-		return fmt.Errorf("Authentication context was not found in metadata")
+		return fmt.Errorf("authentication context was not found in metadata")
 	}
 
 	if len(authContext) > 1 {
@@ -611,7 +618,7 @@ func (s *ProxyServer) authenticateAgentViaToken(ctx context.Context) error {
 	}
 
 	if err := s.validateAuthToken(ctx, strings.TrimPrefix(authContext[0], header.AuthenticationTokenContextSchemePrefix)); err != nil {
-		return fmt.Errorf("Failed to validate authentication token, err:%v", err)
+		return fmt.Errorf("failed to validate authentication token, err:%v", err)
 	}
 
 	klog.V(2).Infoln("Client successfully authenticated via token")
@@ -703,6 +710,8 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 				klog.ErrorS(err, "CLOSE_RSP to frontend failed", "serverID", s.serverID, "agentID", agentID)
 			}
 		}
+
+		s.cleanupAgentConnections()
 	}()
 
 	for pkt := range recvCh {
@@ -740,20 +749,20 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 		case client.PacketType_DATA:
 			resp := pkt.GetData()
 			klog.V(5).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
-			if resp.ConnectID == int64(KASConnId) {
+			kasConnCtx, isFromAgent := s.getAgentConnection(resp.ConnectID)
+			if isFromAgent {
 				kasConnCtx.dataCh <- resp.Data
+				continue
+			}
+			frontend, err := s.getFrontend(agentID, resp.ConnectID)
+			if err != nil {
+				klog.ErrorS(err, "could not get frontend client", "connectionID", resp.ConnectID)
+				break
+			}
+			if err := frontend.send(pkt); err != nil {
+				klog.ErrorS(err, "send to client stream failure", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
 			} else {
-				frontend, err := s.getFrontend(agentID, resp.ConnectID)
-				if err != nil {
-					klog.ErrorS(err, "could not get frontend client", "connectionID", resp.ConnectID)
-					break
-				}
-				if err := frontend.send(pkt); err != nil {
-					klog.ErrorS(err, "send to client stream failure", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
-				} else {
-					klog.V(5).InfoS("DATA sent to frontend")
-				}
-
+				klog.V(5).InfoS("DATA sent to frontend")
 			}
 
 		case client.PacketType_CLOSE_RSP:
@@ -776,16 +785,21 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 			req := pkt.GetDialRequest()
 			klog.V(5).InfoS("Received DIAL_REQ", "target", req.Address)
 			s.handleDialRequest(pkt, backend)
+		case client.PacketType_CLOSE_REQ:
+			resp := pkt.GetCloseRequest()
+			kasConnCtx, agentConnection := s.getAgentConnection(resp.ConnectID)
+			if !agentConnection {
+				// TODO: is it safe to ignore CLOSE_REQ for proxy instantiated connections?
+				klog.V(5).Info("Received CLOSE_REQ from agent for proxy instantiated connection, skipping")
+				continue
+			}
+			kasConnCtx.cleanup()
 		default:
 			klog.V(2).InfoS("Unrecognized packet", "packet", pkt, "serverID", s.serverID, "agentID", agentID)
 		}
 	}
 	klog.V(5).InfoS("Close backend of agent", "backend", stream, "serverID", s.serverID, "agentID", agentID)
 }
-
-var kasConnCtx *connContext
-
-const KASConnId int64 = 9999999999
 
 func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 	klog.V(4).Infoln("received DIAL_REQ")
@@ -808,17 +822,15 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 	}
 	metrics.Metrics.ObserveDialLatency(time.Since(start))
 
-	// Even identifiers are used for connections from master to node network,
+	// Odd identifiers are used for connections from node to master network,
 	// increment by 2 to maintain the invariant.
-	//connID := atomic.AddInt64(&a.nextConnID, 2)
-	connID := KASConnId
+	connID := atomic.AddInt64(&s.nextConnID, 2)
 	dataCh := make(chan []byte, 5)
-	kasConnCtx = &connContext{
+	kasConnCtx := &connContext{
 		conn:   conn,
 		dataCh: dataCh,
 		cleanFunc: func() {
 			klog.V(4).InfoS("close connection", "connectionID", connID)
-
 			req := &client.Packet{
 				Type: client.PacketType_CLOSE_REQ,
 				Payload: &client.Packet_CloseRequest{
@@ -827,7 +839,6 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 					},
 				},
 			}
-
 			if err := backend.Send(req); err != nil {
 				klog.ErrorS(err, "close request failure")
 			}
@@ -838,10 +849,12 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 			}
 
 			close(dataCh)
-			//a.connManager.Delete(connID)
+			s.deleteAgentConnection(connID)
 		},
 		backend: backend,
 	}
+
+	s.addAgentConnection(connID, kasConnCtx)
 
 	resp.GetDialResponse().ConnectID = connID
 	if err := backend.Send(resp); err != nil {
@@ -850,8 +863,36 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 	}
 
 	// proxy data to and from KAS for the connection
-	go s.remoteToProxy(connID, kasConnCtx)
-	go s.proxyToRemote(connID, kasConnCtx)
+	go s.agentToProxy(connID, kasConnCtx)
+	go s.proxyToAgent(connID, kasConnCtx)
+}
+
+func (s *ProxyServer) addAgentConnection(connID int64, ctx *connContext) {
+	s.kasConnectionsMutex.Lock()
+	defer s.kasConnectionsMutex.Unlock()
+	s.kasConnections[connID] = ctx
+}
+
+func (s *ProxyServer) deleteAgentConnection(connID int64) {
+	s.kasConnectionsMutex.Lock()
+	defer s.kasConnectionsMutex.Unlock()
+	delete(s.kasConnections, connID)
+}
+
+func (s *ProxyServer) getAgentConnection(connID int64) (*connContext, bool) {
+	s.kasConnectionsMutex.RLock()
+	defer s.kasConnectionsMutex.RUnlock()
+	ctx, ok := s.kasConnections[connID]
+	return ctx, ok
+}
+
+func (s *ProxyServer) cleanupAgentConnections() {
+	s.kasConnectionsMutex.Lock()
+	defer s.kasConnectionsMutex.Unlock()
+	// Close all node -> KAS connections
+	for _, kasConn := range s.kasConnections {
+		kasConn.cleanup()
+	}
 }
 
 type connContext struct {
@@ -866,10 +907,7 @@ func (c *connContext) cleanup() {
 	c.cleanOnce.Do(c.cleanFunc)
 }
 
-type proxiedKAS struct {
-}
-
-func (s *ProxyServer) remoteToProxy(connID int64, ctx *connContext) {
+func (s *ProxyServer) agentToProxy(connID int64, ctx *connContext) {
 	defer ctx.cleanup()
 
 	var buf [1 << 12]byte
@@ -900,7 +938,7 @@ func (s *ProxyServer) remoteToProxy(connID int64, ctx *connContext) {
 	}
 }
 
-func (s *ProxyServer) proxyToRemote(connID int64, ctx *connContext) {
+func (s *ProxyServer) proxyToAgent(connID int64, ctx *connContext) {
 	defer ctx.cleanup()
 
 	for d := range ctx.dataCh {
