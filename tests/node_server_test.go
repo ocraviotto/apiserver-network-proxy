@@ -9,7 +9,7 @@ import (
 	"sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 )
 
-// Just to test that the echoserver istself is actually working :D
+// Just to test that the echoserver itself is actually working :D
 func TestEchoServerOnly(t *testing.T) {
 	e := EchoServer{
 		Protocol: "tcp",

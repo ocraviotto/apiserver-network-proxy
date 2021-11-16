@@ -469,6 +469,7 @@ func (a *Client) ServeBiDirectional() {
 			klog.ErrorS(err, "could not read stream")
 			return
 		}
+		klog.V(5).InfoS("[tracing] recv packet", "type", pkt.Type)
 
 		if pkt == nil {
 			klog.V(3).Infoln("empty packet received")
