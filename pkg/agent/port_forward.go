@@ -22,6 +22,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -76,7 +77,9 @@ type PortForwarder struct {
 // Serve accepts incoming TCP connections on the local port and forwards it to
 // the remote destination defined by given the port mapping.
 func (pf *PortForwarder) Serve(ctx context.Context, pm PortMapping) error {
-	lc := net.ListenConfig{}
+	lc := net.ListenConfig{
+		KeepAlive: time.Second * 30,
+	}
 	listenAddr := net.JoinHostPort(pf.ListenHost, strconv.Itoa(pm.LocalPort))
 	klog.V(1).InfoS("starting control plane proxy", "listen-address", listenAddr)
 	// Only TCP is supported at the moment.
@@ -85,30 +88,34 @@ func (pf *PortForwarder) Serve(ctx context.Context, pm PortMapping) error {
 		return err
 	}
 	go func() {
+		defer listener.Close()
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+
+			}
 			klog.V(2).InfoS("listening for connections", "listen-address", listenAddr)
 			conn, err := listener.Accept()
-			klog.V(5).Infof("received connection from %s", conn.LocalAddr().String())
 			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					klog.ErrorS(err, "Error occurred while waiting for connections")
-				}
-			} else {
-				// Serve each connection in a dedicated goroutine
-				go func() {
-					target := net.JoinHostPort(pm.RemoteHost, strconv.Itoa(pm.RemotePort))
-					klog.V(5).Infof("forwarding connection to %s", target)
-					if err := pf.handleConnection("tcp", target, conn); err != nil {
-						if err := conn.Close(); err != nil {
-							klog.ErrorS(err, "Error while closing connection")
-						}
-						klog.ErrorS(err, "Error occurred while handling connection")
-					}
-				}()
+				klog.ErrorS(err, "Error occurred while waiting for connections")
+				continue
 			}
+			klog.V(5).Infof("received connection from %s", conn.LocalAddr().String())
+			// Serve each connection in a dedicated goroutine
+			go func() {
+				// TODO: check why do we close connection only on error?
+				target := net.JoinHostPort(pm.RemoteHost, strconv.Itoa(pm.RemotePort))
+				klog.V(5).Infof("forwarding connection to %s", target)
+				// TODO: pass ctx to handle program stop?
+				if err := pf.handleConnection("tcp", target, conn); err != nil {
+					if err := conn.Close(); err != nil {
+						klog.ErrorS(err, "Error while closing connection")
+					}
+					klog.ErrorS(err, "Error occurred while handling connection")
+				}
+			}()
 		}
 	}()
 	return nil
