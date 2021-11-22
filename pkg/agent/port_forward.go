@@ -98,6 +98,7 @@ func (pf *PortForwarder) Serve(ctx context.Context, pm PortMapping) error {
 			}
 			klog.V(2).InfoS("listening for connections", "listen-address", listenAddr)
 			conn, err := listener.Accept()
+			// TODO: observe metrics here
 			if err != nil {
 				klog.ErrorS(err, "Error occurred while waiting for connections")
 				continue
