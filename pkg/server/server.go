@@ -958,8 +958,6 @@ func (cm *connectionManager) Get(connID int64) (*connContext, bool) {
 }
 
 func (cm *connectionManager) Cleanup() {
-	cm.Lock()
-	defer cm.Unlock()
 	for _, kasConn := range cm.connections {
 		kasConn.cleanup()
 	}
