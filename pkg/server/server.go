@@ -753,18 +753,19 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 			klog.V(5).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
 			kasConnCtx, isFromAgent := s.forwardConnectionManager.Get(resp.ConnectID)
 			if isFromAgent {
-				kasConnCtx.dataCh <- resp.Data
+				s.handleDataPacketFromAgent(resp, kasConnCtx)
 				continue
-			}
-			frontend, err := s.getFrontend(agentID, resp.ConnectID)
-			if err != nil {
-				klog.ErrorS(err, "could not get frontend client", "connectionID", resp.ConnectID)
-				break
-			}
-			if err := frontend.send(pkt); err != nil {
-				klog.ErrorS(err, "send to client stream failure", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
 			} else {
-				klog.V(5).InfoS("DATA sent to frontend")
+				frontend, err := s.getFrontend(agentID, resp.ConnectID)
+				if err != nil {
+					klog.ErrorS(err, "could not get frontend client", "connectionID", resp.ConnectID)
+					break
+				}
+				if err := frontend.send(pkt); err != nil {
+					klog.ErrorS(err, "send to client stream failure", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
+				} else {
+					klog.V(5).InfoS("DATA sent to frontend")
+				}
 			}
 
 		case client.PacketType_CLOSE_RSP:
@@ -827,10 +828,8 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 	// Odd identifiers are used for connections from node to master network,
 	// increment by 2 to maintain the invariant.
 	connID := atomic.AddInt64(&s.nextConnID, 2)
-	dataCh := make(chan []byte, 5)
 	kasConnCtx := &connContext{
-		conn:   conn,
-		dataCh: dataCh,
+		conn: conn,
 		cleanFunc: func() {
 			klog.V(4).InfoS("close connection", "connectionID", connID)
 			req := &client.Packet{
@@ -850,7 +849,6 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 				klog.ErrorS(err, "error occurred while closing connection", "connectionID", connID)
 			}
 
-			close(dataCh)
 			s.forwardConnectionManager.Delete(connID)
 		},
 		backend: backend,
@@ -866,13 +864,11 @@ func (s *ProxyServer) handleDialRequest(pkt *client.Packet, backend Backend) {
 
 	// proxy data to and from KAS for the connection
 	go s.agentToProxy(connID, kasConnCtx)
-	go s.proxyToAgent(connID, kasConnCtx)
 }
 
 type connContext struct {
 	conn      net.Conn
 	cleanFunc func()
-	dataCh    chan []byte
 	cleanOnce sync.Once
 	backend   Backend
 }
@@ -912,24 +908,22 @@ func (s *ProxyServer) agentToProxy(connID int64, ctx *connContext) {
 	}
 }
 
-func (s *ProxyServer) proxyToAgent(connID int64, ctx *connContext) {
-	defer ctx.cleanup()
-
-	for d := range ctx.dataCh {
-		pos := 0
-		for {
-			n, err := ctx.conn.Write(d[pos:])
-			if err == nil {
-				klog.V(4).InfoS("write to remote", "connectionID", connID, "lastData", n)
-				break
-			} else if n > 0 {
-				// https://golang.org/pkg/io/#Writer specifies return non nil error if n < len(d)
-				klog.ErrorS(err, "write to remote with failure", "connectionID", connID, "lastData", n)
-				pos += n
-			} else {
-				klog.ErrorS(err, "conn write failure", "connectionID", connID)
-				return
-			}
+func (s *ProxyServer) handleDataPacketFromAgent(resp *client.Data, kasConnCtx *connContext) {
+	pos := 0
+	connID := resp.ConnectID
+	d := resp.Data
+	for {
+		n, err := kasConnCtx.conn.Write(d[pos:])
+		if err == nil {
+			klog.V(4).InfoS("write to remote", "connectionID", connID, "lastData", n)
+			break
+		} else if n > 0 {
+			// https://golang.org/pkg/io/#Writer specifies return non nil error if n < len(d)
+			klog.ErrorS(err, "write to remote with failure", "connectionID", connID, "lastData", n)
+			pos += n
+		} else {
+			klog.ErrorS(err, "conn write failure", "connectionID", connID)
+			return
 		}
 	}
 }
