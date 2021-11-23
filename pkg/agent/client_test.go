@@ -24,6 +24,7 @@ func TestServeData_NodeToMaster(t *testing.T) {
 	testClient := &Client{
 		connManager: newConnectionManager(),
 		stopCh:      stopCh,
+		cs:          &ClientSet{},
 	}
 	testClient.stream, stream = pipe()
 
@@ -137,6 +138,7 @@ func TestServeData_NodeToMasterConnectionFailure(t *testing.T) {
 	testClient := &Client{
 		connManager: newConnectionManager(),
 		stopCh:      stopCh,
+		cs:          &ClientSet{},
 	}
 	testClient.stream, stream = pipe()
 
@@ -185,6 +187,7 @@ func TestServeData_HTTP(t *testing.T) {
 	testClient := &Client{
 		connManager: newConnectionManager(),
 		stopCh:      stopCh,
+		cs:          &ClientSet{},
 	}
 	testClient.stream, stream = pipe()
 
