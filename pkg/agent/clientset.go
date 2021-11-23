@@ -17,6 +17,7 @@ limitations under the License.
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -33,7 +34,7 @@ import (
 
 // ClientSet consists of clients connected to each instance of an HA proxy server.
 type ClientSet struct {
-	mu      sync.Mutex         //protects the clients.
+	mu      sync.RWMutex       //protects the clients.
 	clients map[string]*Client // map between serverID and the client
 	// connects to this server.
 	serverIDs []string
@@ -223,21 +224,32 @@ func (cs *ClientSet) Serve() {
 }
 
 func (cs *ClientSet) handleConnection(protocol, address string, conn net.Conn) error {
+
+	client, err := cs.getRandomClient()
 	// close the connection if no client is available
 	// TODO(irozzo): check if this can be handled better
-	if len(cs.clients) == 0 {
+	if err != nil {
 		klog.V(2).InfoS("no clients available for connection", "protocol", protocol, "address", address)
-		err := conn.Close()
-		if err != nil {
-			klog.ErrorS(err, "error occurred while closing connection because of no available clients", "address", address, "protocol", protocol)
+		closeErr := conn.Close()
+		if closeErr != nil {
+			klog.ErrorS(closeErr, "error occurred while closing connection because of no available clients", "address", address, "protocol", protocol)
 		}
-		return fmt.Errorf("no client available for handling %s connection to %s", protocol, address)
+		return fmt.Errorf("no client available for handling %s connection to %s: %w", protocol, address, err)
 	}
-	// pick random client to handle the connection
-	serverID := cs.serverIDs[rand.Intn(len(cs.serverIDs))] /* #nosec G404 */
 	// this call is blocking until the connection is establised or a timeout is
 	// raised
-	return cs.clients[serverID].handleConnection(protocol, address, conn)
+	return client.handleConnection(protocol, address, conn)
+}
+
+func (cs *ClientSet) getRandomClient() (*Client, error) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if len(cs.clients) == 0 {
+		return nil, errors.New("no clients available")
+	}
+	serverID := cs.serverIDs[rand.Intn(len(cs.serverIDs))] /* #nosec G404 */
+	client := cs.clients[serverID]
+	return client, nil
 }
 
 func (cs *ClientSet) shutdown() {

@@ -568,7 +568,7 @@ func (a *Client) handleDialResponse(pkt *client.Packet) {
 	pd, ok := a.connManager.GetPendingConnection(dialRes.Random)
 	if !ok {
 		// TODO(irozzo)
-		// TODO(soider): check if we leak any connection
+		// TODO(soider): check if we leak any connection here
 		klog.Errorf("no pending dial context associated to random %d", dialRes.Random)
 		return
 	}
