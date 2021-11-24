@@ -20,7 +20,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
+	"net"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/golang/mock/gomock"
@@ -32,6 +35,8 @@ import (
 	fakeauthenticationv1 "k8s.io/client-go/kubernetes/typed/authentication/v1/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
+	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
 	agentmock "sigs.k8s.io/apiserver-network-proxy/proto/agent/mocks"
 	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
@@ -216,5 +221,141 @@ func TestAddRemoveFrontends(t *testing.T) {
 	}
 	if e, a := expectedFrontends, p.frontends; !reflect.DeepEqual(e, a) {
 		t.Errorf("expected %v, got %v", e, a)
+	}
+}
+
+type testStream struct {
+	agent.AgentService_ConnectServer
+	ch chan *client.Packet
+}
+
+func (f testStream) SendHeader(md metadata.MD) error {
+	return nil
+}
+
+func (f testStream) Context() context.Context {
+	ctx := context.Background()
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(header.AgentID, "test-agent-1"))
+	return ctx
+}
+
+func (t testStream) Send(packet *client.Packet) error {
+	return nil
+}
+
+func (t testStream) Recv() (*client.Packet, error) {
+	v, ok := <-t.ch
+	if !ok {
+		return nil, io.EOF
+	}
+	return v, nil
+}
+
+func TestNodeToControlPlane(t *testing.T) {
+	testData := []byte("this is test data")
+	stub := gomock.NewController(t)
+	defer stub.Finish()
+	var wg sync.WaitGroup
+
+	// create proxy server
+	p := NewProxyServer("", []ProxyStrategy{ProxyStrategyDefault}, 1,
+		&AgentTokenAuthenticationOptions{}, false)
+
+	// start a controlplane server
+	lis, err := net.Listen("tcp", ":0")
+	if err != nil {
+		panic(err)
+	}
+
+	var receivedData []byte
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, err := lis.Accept()
+		if err != nil {
+			panic(err)
+		}
+		for {
+			var data [20]byte
+			n, err := conn.Read(data[:])
+			if err == io.EOF {
+				break
+			}
+
+			if err != nil {
+				panic(err)
+			}
+			receivedData = append(receivedData, data[:n]...)
+		}
+	}()
+
+	stream := &testStream{ch: make(chan *client.Packet, 15)}
+	wg.Add(1)
+
+	go func() {
+		connID := int64(3)
+		stream.ch <- packetDialReq(lis.Addr().String())
+		stream.ch <- packetData(connID, testData)
+		stream.ch <- packetDataEOF(connID)
+		stream.ch <- packetCloseReq(connID)
+		close(stream.ch)
+		wg.Done()
+	}()
+	// connect the agent to proxy server
+	err = p.Connect(stream)
+	if err != nil {
+		panic(err)
+	}
+	wg.Wait()
+	if !reflect.DeepEqual(testData, receivedData) {
+		t.Fatalf("Expected: %v Got: %v", testData, receivedData)
+	}
+}
+
+func packetCloseReq(connID int64) *client.Packet {
+	return &client.Packet{
+		Type: client.PacketType_CLOSE_REQ,
+		Payload: &client.Packet_CloseRequest{
+			CloseRequest: &client.CloseRequest{
+				ConnectID: connID,
+			},
+		},
+	}
+}
+
+func packetData(connID int64, testData []byte) *client.Packet {
+	return &client.Packet{
+		Type: client.PacketType_DATA,
+		Payload: &client.Packet_Data{
+			Data: &client.Data{
+				ConnectID: connID,
+				Data:      testData,
+			},
+		},
+	}
+}
+
+func packetDialReq(addr string) *client.Packet {
+	return &client.Packet{
+		Type: client.PacketType_DIAL_REQ,
+		Payload: &client.Packet_DialRequest{
+			DialRequest: &client.DialRequest{
+				Protocol: "tcp",
+				Address:  addr,
+				Random:   rand.Int63(),
+			},
+		},
+	}
+}
+
+func packetDataEOF(connID int64) *client.Packet {
+	return &client.Packet{
+		Type: client.PacketType_DATA,
+		Payload: &client.Packet_Data{
+			Data: &client.Data{
+				ConnectID: connID,
+				Error:     io.EOF.Error(),
+			},
+		},
 	}
 }

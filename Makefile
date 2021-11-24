@@ -77,6 +77,9 @@ bin/http-test-server: bin cmd/test-server/main.go
 bin/proxy-server: proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go bin cmd/server/main.go pkg/server/server.go pkg/server/metrics/metrics.go
 	GO111MODULE=on go build -o bin/proxy-server cmd/server/main.go
 
+bin/proxy-server-static: proto/agent/agent.pb.go konnectivity-client/proto/client/client.pb.go bin cmd/server/main.go
+	GO111MODULE=on CGO_ENABLED=0 go build -o bin/proxy-server-static -a -gcflags="all=-N -l" -ldflags="-extldflags=-static" cmd/server/main.go
+
 ## --------------------------------------
 ## Linting
 ## --------------------------------------
