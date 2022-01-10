@@ -198,6 +198,7 @@ func (s *ProxyServer) addBackend(agentID string, conn agent.AgentService_Connect
 	for i := 0; i < len(s.BackendManagers); i++ {
 		switch s.BackendManagers[i].(type) {
 		case *DestHostBackendManager:
+			// the logic here is mostly broken for the case when we have few identifiers
 			agentIdentifiers, err := getAgentIdentifiers(conn)
 			if err != nil {
 				klog.ErrorS(err, "fail to get the agent identifiers", "agentID", agentID)
@@ -205,15 +206,15 @@ func (s *ProxyServer) addBackend(agentID string, conn agent.AgentService_Connect
 			}
 			for _, ipv4 := range agentIdentifiers.IPv4 {
 				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv4)
-				s.BackendManagers[i].AddBackend(ipv4, pkgagent.IPv4, conn)
+				backend = s.BackendManagers[i].AddBackend(ipv4, pkgagent.IPv4, conn)
 			}
 			for _, ipv6 := range agentIdentifiers.IPv6 {
 				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv6)
-				s.BackendManagers[i].AddBackend(ipv6, pkgagent.IPv6, conn)
+				backend = s.BackendManagers[i].AddBackend(ipv6, pkgagent.IPv6, conn)
 			}
 			for _, host := range agentIdentifiers.Host {
 				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", host)
-				s.BackendManagers[i].AddBackend(host, pkgagent.Host, conn)
+				backend = s.BackendManagers[i].AddBackend(host, pkgagent.Host, conn)
 			}
 		case *DefaultRouteBackendManager:
 			agentIdentifiers, err := getAgentIdentifiers(conn)
@@ -651,9 +652,14 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 		return err
 	}
 
+	var nilBackend Backend = nil
 	backend := s.addBackend(agentID, stream)
+	if backend == nilBackend {
+		klog.V(2).InfoS("Unable to add backend", "agentID", agentID, "serverID", s.serverID)
+		return fmt.Errorf("no backend added")
+	}
+	// we can't compare `backend` to nil equality because it is interface variable
 	defer s.removeBackend(agentID, stream)
-
 	recvCh := make(chan *client.Packet, xfrChannelSize)
 
 	go s.serveRecvBackend(backend, stream, agentID, recvCh)
