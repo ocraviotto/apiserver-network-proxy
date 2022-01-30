@@ -317,7 +317,7 @@ func (p *Proxy) runAgentServer(o *options.ProxyRunOptions, server *server.ProxyS
 		return err
 	}
 
-	addr := fmt.Sprintf(":%d", o.AgentPort)
+	addr := fmt.Sprintf("%s:%d", o.AgentBindAddress, o.AgentPort)
 	agentServerOptions := []grpc.ServerOption{
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
 		grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.KeepaliveTime}),

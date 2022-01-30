@@ -2,12 +2,14 @@ package options
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server"
@@ -33,6 +35,8 @@ type ProxyRunOptions struct {
 	ServerPort uint
 	// Port we listen for agent connections on.
 	AgentPort uint
+	// Adress to bind the agent port to when listening for agent connections.
+	AgentBindAddress string
 	// Port we listen for admin connections on.
 	AdminPort uint
 	// Port we listen for health connections on.
@@ -100,6 +104,7 @@ func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
 	flags.BoolVar(&o.DeleteUDSFile, "delete-existing-uds-file", o.DeleteUDSFile, "If true and if file UdsName already exists, delete the file before listen on that UDS file")
 	flags.UintVar(&o.ServerPort, "server-port", o.ServerPort, "Port we listen for server connections on. Set to 0 for UDS.")
 	flags.UintVar(&o.AgentPort, "agent-port", o.AgentPort, "Port we listen for agent connections on.")
+	flags.StringVar(&o.AgentBindAddress, "agent-bind-address", o.AgentBindAddress, "Adress to bind the agent port to when listening for agent connections.")
 	flags.UintVar(&o.AdminPort, "admin-port", o.AdminPort, "Port we listen for admin connections on.")
 	flags.UintVar(&o.HealthPort, "health-port", o.HealthPort, "Port we listen for health connections on.")
 	flags.DurationVar(&o.KeepaliveTime, "keepalive-time", o.KeepaliveTime, "Time for gRPC agent server keepalive.")
@@ -132,6 +137,7 @@ func (o *ProxyRunOptions) Print() {
 	klog.V(1).Infof("DeleteUDSFile set to %v.\n", o.DeleteUDSFile)
 	klog.V(1).Infof("Server port set to %d.\n", o.ServerPort)
 	klog.V(1).Infof("Agent port set to %d.\n", o.AgentPort)
+	klog.V(1).Infof("Agent Bind Address set to %s.\n", o.AgentBindAddress)
 	klog.V(1).Infof("Admin port set to %d.\n", o.AdminPort)
 	klog.V(1).Infof("Health port set to %d.\n", o.HealthPort)
 	klog.V(1).Infof("Keepalive time set to %v.\n", o.KeepaliveTime)
@@ -242,6 +248,11 @@ func (o *ProxyRunOptions) Validate() error {
 		return fmt.Errorf("if --enable-contention-profiling is set, --enable-profiling must also be set")
 	}
 
+	// Validate the Agent Bind Address
+	if err := validateHostnameOrIP(o.AgentBindAddress); o.AgentBindAddress != "" && err != nil {
+		return fmt.Errorf("agent bind address is set but invalid: %v", err)
+	}
+
 	// validate agent authentication params
 	// all 4 parameters must be empty or must have value (except KubeconfigPath that might be empty)
 	if o.AgentNamespace != "" || o.AgentServiceAccount != "" || o.AuthenticationAudience != "" || o.KubeconfigPath != "" {
@@ -325,4 +336,16 @@ func NewProxyRunOptions() *ProxyRunOptions {
 		CipherSuites:              "",
 	}
 	return &o
+}
+
+func validateHostnameOrIP(hostnameOrIP string) error {
+	// If it is an IP return immediately otherwise check if it is a hostname
+	if net.ParseIP(hostnameOrIP) != nil {
+		return nil
+	}
+	// If it it not a valid hostname return an error
+	if errs := validation.IsDNS1123Label(hostnameOrIP); len(errs) > 0 {
+		return fmt.Errorf("%s is not a valid ip or hostname: %s", hostnameOrIP, strings.Join(errs, ","))
+	}
+	return nil
 }
